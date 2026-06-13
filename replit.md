@@ -1,0 +1,102 @@
+# CreatrWeb
+
+An author-owned microblogging platform for one canonical publisher, with authenticated visitors participating through comments and reactions.
+
+## Run & Operate
+
+- `npm run typecheck`: Type-check all packages.
+- `npm run build`: Type-check and build all packages.
+- `npm run codegen --workspace=@workspace/api-spec`: Regenerate API hooks and Zod schemas.
+- `npm run push-force --workspace=@workspace/db`: Force-push DB schema changes for manual inspection only; normal startup reconciliation happens through `ensureTables()`.
+- `npm run dev`: One-port development run, serving frontend and API/Auth routes from the API server.
+- `npm run dev:hot`: Two-port hot-reload workflow for API server and Vite frontend.
+- `npm run list-users --workspace=@workspace/scripts`: List local users.
+- `npm run promote-owner --workspace=@workspace/scripts -- --email you@example.com`: Promote user to owner role.
+
+**Required Environment Variables:**
+- `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASS`: MySQL connection details.
+- `DB_SSL=true`: Required for most hosted MySQL providers (Hostinger, Railway, etc.).
+- `ALLOWED_ORIGINS`: Comma-separated origins for CORS. Must match your deployment domain. Also used by the admin UI to generate OAuth callback URLs for platform syndication setup.
+- `AUTH_SECRET`, `SESSION_SECRET`: Long random strings for session signing.
+- `GITHUB_ID`, `GITHUB_SECRET` OR `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`: OAuth credentials for sign-in (at least one provider required).
+- `AI_SETTINGS_ENCRYPTION_KEY`: 32-byte secret (base64 or hex) for encrypting AI API keys and platform OAuth app credentials at rest. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
+- `CRON_SECRET`: Required if using the GitHub Actions scheduled feed refresh.
+
+## Stack
+
+- **Monorepo**: npm workspaces
+- **Node.js**: 24
+- **TypeScript**: 5.9
+- **API**: Express 5
+- **Database**: MySQL (mysql2) + Drizzle ORM
+- **Validation**: Zod (v3), drizzle-zod
+- **API Codegen**: Orval (from OpenAPI spec)
+- **Build**: esbuild
+- **Auth**: Auth.js (GitHub, Google OAuth, local sessions)
+- **Frontend**: React + Vite (Tailwind CSS)
+
+## Where things live
+
+- `artifacts/api-server/`: Express API server.
+- `artifacts/microblog/`: React + Vite frontend.
+- `lib/db/`: Drizzle schema and DB client.
+  - Source-of-truth: `lib/db/src/schema/` (DB schema), `lib/db/install.sql` (full DB install script).
+- `lib/api-spec/`: OpenAPI 3.1 spec and Orval codegen config.
+  - Source-of-truth: `lib/api-spec/openapi.yaml` (API contracts).
+- `lib/api-client-react/`: Generated React Query hooks.
+- `lib/api-zod/`: Generated Zod request/response schemas.
+- `artifacts/microblog/src/index.css`: Theme styles.
+- `artifacts/microblog/src/lib/site-themes.ts`: Catalog of themes and palettes.
+
+## Architecture decisions
+
+- **Monorepo Structure**: Uses npm workspaces for a unified development environment for multiple packages, enhancing code sharing and consistency.
+- **Single-Runnable Deployment**: The application is deployed as a single runnable to ensure correct routing order for all API endpoints, including feeds, avoiding issues with static asset edge handlers.
+- **Host-Agnostic Feed URLs**: Feed URL generation (`feeds.ts`, `feeds-catalog.ts`) derives the origin from `x-forwarded-proto`/`x-forwarded-host` (or the raw Express host as fallback). `PUBLIC_SITE_URL` is intentionally not used for feed URLs so the correct host is reflected across local, Replit dev, and Replit production environments.
+- **Replit Webview Proxy Limitation**: The Replit dev proxy only forwards `/api/*` paths to Express; all other paths are served as the SPA (`index.html`), regardless of file extension. This affects both the `*.replit.dev` webview URL and any custom domain CNAMEd to `*.replit.dev` (including `platform.creatrweb.com` while it points to the dev URL). **Fix**: feed content routes and the catalog URL generation were moved into the API router (under `/api`) in `feeds-catalog.ts`. The primary feed URLs are now `/api/feeds/atom`, `/api/feeds/json`, `/api/feeds/mf2`, `/api/categories/:slug/feeds/atom`, `/api/categories/:slug/feeds/json`, `/api/p/:slug/feeds/atom`, and `/api/p/:slug/feeds/json`. The original extension-based routes (`/feed.xml`, `/feed.json`, `/atom`, `/jsonfeed`, etc.) are kept as backward-compatible aliases in `feeds.ts`.
+- **Port Setup**: The Replit workflow sets `PORT=5000` inline (`PORT=5000 npm run dev`). `externalPort = 80` maps to `localPort = 5000` for the default webview URL. `externalPort = 5000` also maps to `localPort = 5000` for direct port access. `.env` has `PORT=4000` for local development — macOS's AirPlay Receiver occupies port 5000, so local dev uses 4000 while Replit overrides to 5000 via the workflow.
+- **HTML Sanitization**: All HTML feed bodies are sanitized server-side to prevent XSS attacks, stripping dangerous markup while preserving necessary microformats2 markers.
+- **Measurement-based Navbar**: The header dynamically adjusts inline navigation links and search bar visibility based on available width, using a `ResizeObserver` to optimize layout across various desktop screen sizes without a fixed hamburger.
+- **Dedicated `content_text` column for Full-Text Search**: A separate, automatically populated `content_text` column on the `posts` table ensures that the MySQL FULLTEXT index is always synchronized with the rendered post body, providing consistent and accurate search results.
+- **In-Process Post Scheduler**: `startPostScheduler()` in `artifacts/api-server/src/lib/post-scheduler.ts` runs an `setInterval` every 60 seconds after server startup. It selects all `status='scheduled'` posts whose `scheduled_at` has passed (compared in UTC), flips them to `published`, updates `created_at` to the publish moment, and enqueues any stored `pending_platform_ids` for syndication. The scheduler is stateless and safe to restart — partially-published posts are detected on the next tick by the `status='scheduled'` filter.
+- **Live Art Piece Embeds**: Piece iframe URLs at `/embed/pieces/:id` resolve the current version unless a `?version=` query is supplied explicitly. Current embeds therefore update when the owner saves a new piece version in `/admin/pieces`; older version-pinned URLs remain supported for explicit archival rendering.
+- **Immersive View Fullscreen Locking**: The immersive route shell locks document scrolling and touch behavior in route fullscreen and embed mode, syncs viewport CSS variables from `visualViewport`, and uses the browser Fullscreen API when available. Resize handlers preserve the user's camera target instead of recentering on every layout change.
+
+## Product
+
+- **Microblogging**: The owner can create, edit, and syndicate canonical posts; signed-in members can comment and edit their own comments. Posts support four statuses: `published` (public timeline), `pending` (RSS moderation queue), `draft` (saved, not yet queued), and `scheduled` (auto-publish at a future datetime).
+- **User Profiles**: Authenticated users can manage their public identity, including name, username, bio, website, and social links.
+- **Site Customization**: Owners can customize site-wide identity, theme, color palette, and individual colors.
+- **Per-User Profile Theming**: Signed-in users can personalize their individual profile page's theme, palette, and colors, which applies only to their profile content.
+- **Rich Post Editor**: Provides owners with a WYSIWYG editor for posts, supporting text formatting, image uploads, and embedded media (YouTube, generic iframes). The `PostEditor` component wraps `RichPostEditor` and adds publish / draft / schedule mode switching with a date picker for scheduling.
+- **Admin Posts Calendar**: `/admin/posts` shows a weekly calendar grid of published, scheduled, and imported posts alongside a horizontal drafts list. Each day column has a "Schedule" button to open the composer pre-filled for that day. The owner can navigate weeks, and the calendar respects `scheduled_at` as the display date for scheduled posts.
+- **Interactive Pieces**: Owners can generate and manage reusable `p5`, `c2`, and `three` pieces. AI generation returns mandatory HTML/CSS/JS code blocks, the API preflights drafts before display, thumbnails are captured into the media library, and embed snippets resolve the current piece version live at `/embed/pieces/:id`.
+- **Media Library**: `/admin/library` stores uploaded or URL-imported images as MySQL-backed media assets with title, alt text, local bytes, and exhibit memberships. Vision-capable AI vendors can generate alt text; DeepSeek is not offered for alt text until image-input support is verified.
+- **Exhibits**: `/admin/exhibits` creates named collections of art pieces and images. Each exhibit has a slug, description, artist statement, biography, rows/cols layout, and a public Three.js wall at `/immersive/exhibits/:slug`. Rich posts can insert exhibits as iframe embeds, and the wall progressively runs only nearby interactive pieces live while off-target pieces use thumbnails or snapshots.
+- **Immersive Routes**: Images, pieces, and exhibits can be opened in immersive 3D presentation routes (`/immersive/images/:encodedRef`, `/immersive/pieces/:id`, `/immersive/exhibits/:slug`). Rendered post content adds immersive triggers for images, piece embeds, and exhibit embeds.
+- **Inbound Feeds (PESOS)**: Owners can subscribe to external RSS/Atom feeds, review imported items, and manage their publication status. A GitHub Actions workflow (`.github/workflows/feed-refresh.yml`) hits `POST /api/feed-sources/refresh` hourly so new items land automatically without manual intervention. Requires `CRON_SECRET` and `PUBLIC_SITE_URL` as GitHub Actions secrets.
+- **Outbound Feeds**: The site publishes Atom (`/api/feeds/atom`), JSON Feed (`/api/feeds/json`), and Microformats2 export (`/api/feeds/mf2`). Per-category and per-page variants follow the same pattern (e.g. `/api/categories/:slug/feeds/atom`, `/api/p/:slug/feeds/atom`). The legacy extension-based and extension-free routes (`/feed.xml`, `/feed.json`, `/atom`, `/jsonfeed`, etc.) are kept as backward-compatible aliases.
+- **Outbound Syndication**: Platform connections currently cover WordPress.com, self-hosted WordPress, Blogger, Substack, Bluesky, LinkedIn, Facebook, and Instagram. Social platforms use per-platform post drafts when present and fall back to generated canonical-link text.
+- **AI Vendors**: Owner AI settings currently expose OpenRouter, OpenCode Zen, OpenCode Go, Google, Mistral AI, Mistral Vibe, and DeepSeek. Text improvement allows all configured vendors; image alt text excludes DeepSeek; piece generation is limited to Google, Mistral AI, Mistral Vibe, and DeepSeek.
+- **Full-Text Search**: Provides a search interface for posts with filters for categories, sources, author, and content format.
+- **Category Management**: Owners can create, rename, and delete categories for posts.
+
+## User preferences
+
+- _Populate as you build_
+
+## Gotchas
+
+- **MySQL DATETIME**: Use `formatMysqlDateTime()` for app-managed MySQL `DATETIME(3)` writes, not `toISOString()`, to prevent timezone-related display issues. Use `formatMysqlDateTimeUtc()` for `scheduled_at` specifically — the post-scheduler compares stored values against UTC `NOW()`, so both sides must use UTC.
+- **Codegen Drift**: After any change to `lib/api-spec/openapi.yaml`, run `npm run codegen --workspace=@workspace/api-spec` to regenerate API clients and Zod schemas to avoid type errors.
+- **Phantom Git Parents**: If `git push` fails with "did not receive expected object", use `git fast-export --all --reference-excluded-parents | git fast-import` into a temporary repo, then force-push to `origin/main` to resolve dangling parent references.
+- **Auth.js `AUTH_URL`**: Do not set `AUTH_URL` or `NEXTAUTH_URL` in `.env`; the application derives these values dynamically to prevent OAuth redirect mismatches.
+
+## Pointers
+
+- **Creatrweb Framework**: [https://github.com/cfornesa/creatrweb](https://github.com/cfornesa/creatrweb)
+- **OpenAPI Specification**: [https://spec.openapis.org/oas/v3.1.0](https://spec.openapis.org/oas/v3.1.0)
+- **Drizzle ORM**: [https://orm.drizzle.team/](https://orm.drizzle.team/)
+- **Auth.js Documentation**: [https://authjs.dev/](https://authjs.dev/)
+- **React Documentation**: [https://react.dev/](https://react.dev/)
+- **Vite Documentation**: [https://vitejs.dev/](https://vitejs.dev/)

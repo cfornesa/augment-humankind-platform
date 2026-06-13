@@ -1,0 +1,752 @@
+import fs from "fs";
+import type { Request } from "express";
+import { db, postsTable, categoriesTable, pagesTable, siteSettingsTable, usersTable, eq, and, siteSettingsDefaults } from "@workspace/db";
+import { getCanonicalOrigin } from "./origin";
+
+const _htmlCache = new Map<string, string>();
+function readHtml(htmlPath: string): string {
+  const cached = _htmlCache.get(htmlPath);
+  if (cached !== undefined) return cached;
+  const content = fs.readFileSync(htmlPath, "utf-8");
+  _htmlCache.set(htmlPath, content);
+  return content;
+}
+
+const KNOWN_THEMES = new Set([
+  "bauhaus",
+  "traditional",
+  "minimalist",
+  "academic",
+  "airy",
+  "nature",
+  "comfort",
+  "audacious",
+  "artistic",
+]);
+
+/**
+ * Strict HSL token format: `<h> <s>% <l>%`. Mirrors the OpenAPI pattern
+ * applied to every color column in `UpdateUserProfileBody` (so the API
+ * never accepts anything else) AND is enforced again here as
+ * defense-in-depth: any value that doesn't match is dropped, never
+ * interpolated into HTML.
+ */
+const HSL_PATTERN = /^[0-9]{1,3}(\.[0-9]+)? [0-9]{1,3}(\.[0-9]+)?% [0-9]{1,3}(\.[0-9]+)?%$/;
+
+function safeHsl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  if (value.length === 0 || value.length > 32) return null;
+  return HSL_PATTERN.test(value) ? value : null;
+}
+
+function safeThemeId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return KNOWN_THEMES.has(value) ? value : null;
+}
+
+type PartialSettings = {
+  theme?: string | null;
+  colorBackground?: string | null;
+  colorForeground?: string | null;
+  colorBackgroundDark?: string | null;
+  colorForegroundDark?: string | null;
+  colorPrimary?: string | null;
+  colorPrimaryForeground?: string | null;
+  colorSecondary?: string | null;
+  colorSecondaryForeground?: string | null;
+  colorAccent?: string | null;
+  colorAccentForeground?: string | null;
+  colorMuted?: string | null;
+  colorMutedForeground?: string | null;
+  colorDestructive?: string | null;
+  colorDestructiveForeground?: string | null;
+  siteTitle?: string | null;
+  heroSubheading?: string | null;
+  logoUrl?: string | null;
+  logoDarkUrl?: string | null;
+  logoLayout?: string | null;
+  defaultThemeMode?: string | null;
+  colorPrimaryDark?: string | null;
+  colorPrimaryForegroundDark?: string | null;
+  colorSecondaryDark?: string | null;
+  colorSecondaryForegroundDark?: string | null;
+  colorAccentDark?: string | null;
+  colorAccentForegroundDark?: string | null;
+  colorMutedDark?: string | null;
+  colorMutedForegroundDark?: string | null;
+  colorDestructiveDark?: string | null;
+  colorDestructiveForegroundDark?: string | null;
+};
+
+const PALETTES: Record<string, Record<string, string>> = {
+  bauhaus: {
+    colorPrimaryDark: "0 100% 50%",
+    colorPrimaryForegroundDark: "0 0% 100%",
+    colorSecondaryDark: "240 100% 50%",
+    colorSecondaryForegroundDark: "0 0% 100%",
+    colorAccentDark: "60 100% 50%",
+    colorAccentForegroundDark: "0 0% 0%",
+    colorMutedDark: "0 0% 15%",
+    colorMutedForegroundDark: "0 0% 70%",
+    colorDestructiveDark: "0 100% 50%",
+    colorDestructiveForegroundDark: "0 0% 100%",
+  },
+  monochrome: {
+    colorPrimaryDark: "0 0% 90%",
+    colorPrimaryForegroundDark: "0 0% 10%",
+    colorSecondaryDark: "0 0% 70%",
+    colorSecondaryForegroundDark: "0 0% 10%",
+    colorAccentDark: "0 0% 20%",
+    colorAccentForegroundDark: "0 0% 95%",
+    colorMutedDark: "0 0% 15%",
+    colorMutedForegroundDark: "0 0% 80%",
+    colorDestructiveDark: "0 65% 55%",
+    colorDestructiveForegroundDark: "0 0% 100%",
+  },
+  newsprint: {
+    colorPrimaryDark: "40 25% 92%",
+    colorPrimaryForegroundDark: "0 0% 10%",
+    colorSecondaryDark: "0 70% 50%",
+    colorSecondaryForegroundDark: "0 0% 10%",
+    colorAccentDark: "40 50% 30%",
+    colorAccentForegroundDark: "40 25% 92%",
+    colorMutedDark: "0 0% 20%",
+    colorMutedForegroundDark: "40 25% 80%",
+    colorDestructiveDark: "0 75% 50%",
+    colorDestructiveForegroundDark: "0 0% 10%",
+  },
+  ocean: {
+    colorPrimaryDark: "205 90% 60%",
+    colorPrimaryForegroundDark: "215 50% 10%",
+    colorSecondaryDark: "190 80% 55%",
+    colorSecondaryForegroundDark: "215 50% 10%",
+    colorAccentDark: "175 80% 40%",
+    colorAccentForegroundDark: "200 50% 95%",
+    colorMutedDark: "215 35% 20%",
+    colorMutedForegroundDark: "200 40% 80%",
+    colorDestructiveDark: "0 80% 60%",
+    colorDestructiveForegroundDark: "0 0% 100%",
+  },
+  forest: {
+    colorPrimaryDark: "140 50% 55%",
+    colorPrimaryForegroundDark: "130 30% 10%",
+    colorSecondaryDark: "30 50% 55%",
+    colorSecondaryForegroundDark: "130 30% 10%",
+    colorAccentDark: "70 40% 25%",
+    colorAccentForegroundDark: "90 25% 92%",
+    colorMutedDark: "130 20% 20%",
+    colorMutedForegroundDark: "90 25% 80%",
+    colorDestructiveDark: "0 70% 55%",
+    colorDestructiveForegroundDark: "0 0% 100%",
+  },
+  sunset: {
+    colorPrimaryDark: "15 90% 65%",
+    colorPrimaryForegroundDark: "15 40% 10%",
+    colorSecondaryDark: "340 80% 65%",
+    colorSecondaryForegroundDark: "15 40% 10%",
+    colorAccentDark: "45 80% 35%",
+    colorAccentForegroundDark: "30 60% 92%",
+    colorMutedDark: "15 30% 22%",
+    colorMutedForegroundDark: "30 60% 85%",
+    colorDestructiveDark: "0 80% 55%",
+    colorDestructiveForegroundDark: "0 0% 100%",
+  },
+  sepia: {
+    colorPrimaryDark: "30 60% 65%",
+    colorPrimaryForegroundDark: "25 30% 10%",
+    colorSecondaryDark: "35 50% 60%",
+    colorSecondaryForegroundDark: "25 30% 10%",
+    colorAccentDark: "40 50% 25%",
+    colorAccentForegroundDark: "35 40% 88%",
+    colorMutedDark: "25 25% 18%",
+    colorMutedForegroundDark: "35 40% 80%",
+    colorDestructiveDark: "0 70% 50%",
+    colorDestructiveForegroundDark: "25 30% 10%",
+  },
+  "high-contrast": {
+    colorPrimaryDark: "240 100% 70%",
+    colorPrimaryForegroundDark: "0 0% 0%",
+    colorSecondaryDark: "280 100% 65%",
+    colorSecondaryForegroundDark: "0 0% 0%",
+    colorAccentDark: "50 100% 50%",
+    colorAccentForegroundDark: "0 0% 0%",
+    colorMutedDark: "0 0% 20%",
+    colorMutedForegroundDark: "0 0% 100%",
+    colorDestructiveDark: "0 100% 60%",
+    colorDestructiveForegroundDark: "0 0% 0%",
+  },
+  pastel: {
+    colorPrimaryDark: "330 50% 40%",
+    colorPrimaryForegroundDark: "320 30% 95%",
+    colorSecondaryDark: "200 45% 40%",
+    colorSecondaryForegroundDark: "320 30% 95%",
+    colorAccentDark: "60 40% 30%",
+    colorAccentForegroundDark: "320 30% 95%",
+    colorMutedDark: "280 15% 22%",
+    colorMutedForegroundDark: "320 20% 85%",
+    colorDestructiveDark: "0 50% 45%",
+    colorDestructiveForegroundDark: "0 0% 100%",
+  },
+};
+
+function buildThemeInjection(settings: PartialSettings): { themeId: string; css: string } {
+  const merged = { ...siteSettingsDefaults, ...settings };
+  // Validate every value before interpolating into the inline `<style>`.
+  // Site defaults are trusted, but DB rows may contain anything.
+  const v = (k: keyof PartialSettings): string => {
+    const candidate = (merged as Record<string, unknown>)[k];
+    if (typeof candidate === "string") {
+      const safe = safeHsl(candidate);
+      if (safe !== null) return safe;
+    }
+    const fallback = (siteSettingsDefaults as Record<string, unknown>)[k];
+    return typeof fallback === "string" ? fallback : "0 0% 0%";
+  };
+
+  const activePalette = merged.palette ? PALETTES[merged.palette] : undefined;
+
+  const vDark = (darkKey: keyof PartialSettings, lightKey: keyof PartialSettings): string => {
+    const candidate = (merged as Record<string, unknown>)[darkKey];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      const safe = safeHsl(candidate);
+      if (safe !== null) return safe;
+    }
+    if (activePalette && activePalette[darkKey]) {
+      const stockDark = activePalette[darkKey];
+      if (stockDark) {
+        const safe = safeHsl(stockDark);
+        if (safe !== null) return safe;
+      }
+    }
+    return v(lightKey);
+  };
+
+  const themeId = safeThemeId(merged.theme) ?? "bauhaus";
+
+  const css = `:root {
+  --background: ${v("colorBackground")};
+  --foreground: ${v("colorForeground")};
+  --card: ${v("colorBackground")};
+  --card-foreground: ${v("colorForeground")};
+  --popover: ${v("colorBackground")};
+  --popover-foreground: ${v("colorForeground")};
+  --primary: ${v("colorPrimary")};
+  --primary-foreground: ${v("colorPrimaryForeground")};
+  --secondary: ${v("colorSecondary")};
+  --secondary-foreground: ${v("colorSecondaryForeground")};
+  --accent: ${v("colorAccent")};
+  --accent-foreground: ${v("colorAccentForeground")};
+  --muted: ${v("colorMuted")};
+  --muted-foreground: ${v("colorMutedForeground")};
+  --destructive: ${v("colorDestructive")};
+  --destructive-foreground: ${v("colorDestructiveForeground")};
+  --input: ${v("colorBackground")};
+  --ring: ${v("colorSecondary")};
+}
+.dark {
+  --background: ${v("colorBackgroundDark")};
+  --foreground: ${v("colorForegroundDark")};
+  --card: ${v("colorBackgroundDark")};
+  --card-foreground: ${v("colorForegroundDark")};
+  --popover: ${v("colorBackgroundDark")};
+  --popover-foreground: ${v("colorForegroundDark")};
+  --primary: ${vDark("colorPrimaryDark", "colorPrimary")};
+  --primary-foreground: ${vDark("colorPrimaryForegroundDark", "colorPrimaryForeground")};
+  --secondary: ${vDark("colorSecondaryDark", "colorSecondary")};
+  --secondary-foreground: ${vDark("colorSecondaryForegroundDark", "colorSecondaryForeground")};
+  --accent: ${vDark("colorAccentDark", "colorAccent")};
+  --accent-foreground: ${vDark("colorAccentForegroundDark", "colorAccentForeground")};
+  --muted: ${vDark("colorMutedDark", "colorMuted")};
+  --muted-foreground: ${vDark("colorMutedForegroundDark", "colorMutedForeground")};
+  --destructive: ${vDark("colorDestructiveDark", "colorDestructive")};
+  --destructive-foreground: ${vDark("colorDestructiveForegroundDark", "colorDestructiveForeground")};
+  --input: ${v("colorBackgroundDark")};
+  --ring: ${vDark("colorSecondaryDark", "colorSecondary")};
+}`;
+
+  return { themeId, css };
+}
+
+async function loadSettings(): Promise<PartialSettings> {
+  try {
+    const rows = await db
+      .select()
+      .from(siteSettingsTable)
+      .where(eq(siteSettingsTable.id, 1))
+      .limit(1);
+    return rows[0] ?? {};
+  } catch {
+    return {};
+  }
+}
+
+const FEED_ALTERNATE_LINKS =
+  '<link rel="alternate" type="application/atom+xml" title="Atom feed" href="/feed.xml">\n' +
+  '  <link rel="alternate" type="application/feed+json" title="JSON Feed" href="/feed.json">';
+
+function safeDescription(value: unknown, maxLen = 160): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const truncated = trimmed.length > maxLen ? trimmed.slice(0, maxLen - 1) + "…" : trimmed;
+  return truncated
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function applyThemeToHtml(html: string, themeId: string, css: string, description?: string | null): string {
+  html = html.replace(
+    /(<html\b[^>]*?)(?:\s+data-theme="[^"]*")?(\s*>)/,
+    `$1 data-theme="${themeId}"$2`,
+  );
+  const linkBlock = html.includes('rel="alternate" type="application/atom+xml"')
+    ? ""
+    : `  ${FEED_ALTERNATE_LINKS}\n`;
+  const hasDescription = /<meta\s[^>]*name=["']description["']/i.test(html);
+  const safeDesc = description ? safeDescription(description) : null;
+  const descBlock = !hasDescription && safeDesc
+    ? `  <meta name="description" content="${safeDesc}">\n`
+    : "";
+  html = html.replace(
+    "</head>",
+    `${linkBlock}${descBlock}  <style id="site-settings-theme">${css}</style>\n  </head>`,
+  );
+  return html;
+}
+
+function buildGlobalScripts(canonicalOrigin: string, defaultThemeMode: string | null | undefined): string {
+  const mode = defaultThemeMode || "system";
+  return `
+  <script>
+    window.__CANONICAL_ORIGIN__ = ${JSON.stringify(canonicalOrigin)};
+  </script>
+  <script id="theme-mode-bootstrap">
+    (function() {
+      var stored = localStorage.getItem("theme-mode");
+      var defaultMode = ${JSON.stringify(mode)};
+      var isDark = false;
+      if (stored === "dark") {
+        isDark = true;
+      } else if (stored === "light") {
+        isDark = false;
+      } else {
+        if (defaultMode === "dark") {
+          isDark = true;
+        } else if (defaultMode === "light") {
+          isDark = false;
+        } else {
+          isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        }
+      }
+      if (isDark) {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.remove("dark");
+      }
+    })();
+  </script>
+  `;
+}
+
+export async function injectThemeData(
+  req: Request,
+  htmlPath: string,
+): Promise<string> {
+  const html = readHtml(htmlPath);
+  try {
+    const settings = await loadSettings();
+    const { themeId, css } = buildThemeInjection(settings);
+    const canonicalOrigin = getCanonicalOrigin(req);
+
+    const injectedHtml = applyThemeToHtml(html, themeId, css, settings.heroSubheading);
+
+    const globalScripts = buildGlobalScripts(canonicalOrigin, settings.defaultThemeMode);
+
+    return injectedHtml.replace("</head>", `${globalScripts}\n  </head>`);
+  } catch (err) {
+    console.error("Theme injection failed:", err);
+    return html;
+  }
+}
+
+type UserThemeRow = {
+  id?: string | null;
+  theme?: string | null;
+  colorBackground?: string | null;
+  colorForeground?: string | null;
+  colorBackgroundDark?: string | null;
+  colorForegroundDark?: string | null;
+  colorPrimary?: string | null;
+  colorPrimaryForeground?: string | null;
+  colorSecondary?: string | null;
+  colorSecondaryForeground?: string | null;
+  colorAccent?: string | null;
+  colorAccentForeground?: string | null;
+  colorMuted?: string | null;
+  colorMutedForeground?: string | null;
+  colorDestructive?: string | null;
+  colorDestructiveForeground?: string | null;
+};
+
+const USER_COLOR_COLUMNS: Array<keyof UserThemeRow> = [
+  "colorBackground",
+  "colorForeground",
+  "colorBackgroundDark",
+  "colorForegroundDark",
+  "colorPrimary",
+  "colorPrimaryForeground",
+  "colorSecondary",
+  "colorSecondaryForeground",
+  "colorAccent",
+  "colorAccentForeground",
+  "colorMuted",
+  "colorMutedForeground",
+  "colorDestructive",
+  "colorDestructiveForeground",
+];
+
+/**
+ * Build a `<style>` payload that overrides only the variables the user
+ * has actually set, scoped to a stable attribute selector matching the
+ * client-side `UserThemeScope` wrapper:
+ *
+ *     [data-user-theme-scope="user-<id>"]
+ *
+ * The wrapper renders inside the user-profile page only — never around
+ * `#root` — so navbar and footer always keep the site theme. The `<id>`
+ * portion of the selector is sanitized to `[a-zA-Z0-9_-]` (and is
+ * normally a UUID anyway) so it cannot break out of the attribute value.
+ *
+ * Every interpolated color is validated against `HSL_PATTERN`; any
+ * value that doesn't match is dropped, eliminating the stored-XSS risk
+ * of embedding raw user-controlled strings into a `<style>` tag.
+ */
+export function buildUserThemeCss(user: UserThemeRow, scopeKey: string): string {
+  const lightVars: string[] = [];
+  const darkVars: string[] = [];
+  const get = (k: keyof UserThemeRow): string | null => safeHsl(user[k]);
+
+  const colorBackground = get("colorBackground");
+  const colorForeground = get("colorForeground");
+  const colorBackgroundDark = get("colorBackgroundDark");
+  const colorForegroundDark = get("colorForegroundDark");
+  const colorPrimary = get("colorPrimary");
+  const colorPrimaryForeground = get("colorPrimaryForeground");
+  const colorSecondary = get("colorSecondary");
+  const colorSecondaryForeground = get("colorSecondaryForeground");
+  const colorAccent = get("colorAccent");
+  const colorAccentForeground = get("colorAccentForeground");
+  const colorMuted = get("colorMuted");
+  const colorMutedForeground = get("colorMutedForeground");
+  const colorDestructive = get("colorDestructive");
+  const colorDestructiveForeground = get("colorDestructiveForeground");
+
+  if (colorBackground) {
+    lightVars.push(`--background: ${colorBackground};`);
+    lightVars.push(`--card: ${colorBackground};`);
+    lightVars.push(`--popover: ${colorBackground};`);
+    lightVars.push(`--input: ${colorBackground};`);
+  }
+  if (colorForeground) {
+    lightVars.push(`--foreground: ${colorForeground};`);
+    lightVars.push(`--card-foreground: ${colorForeground};`);
+    lightVars.push(`--popover-foreground: ${colorForeground};`);
+  }
+  if (colorPrimary) lightVars.push(`--primary: ${colorPrimary};`);
+  if (colorPrimaryForeground) lightVars.push(`--primary-foreground: ${colorPrimaryForeground};`);
+  if (colorSecondary) {
+    lightVars.push(`--secondary: ${colorSecondary};`);
+    lightVars.push(`--ring: ${colorSecondary};`);
+  }
+  if (colorSecondaryForeground) lightVars.push(`--secondary-foreground: ${colorSecondaryForeground};`);
+  if (colorAccent) lightVars.push(`--accent: ${colorAccent};`);
+  if (colorAccentForeground) lightVars.push(`--accent-foreground: ${colorAccentForeground};`);
+  if (colorMuted) lightVars.push(`--muted: ${colorMuted};`);
+  if (colorMutedForeground) lightVars.push(`--muted-foreground: ${colorMutedForeground};`);
+  if (colorDestructive) lightVars.push(`--destructive: ${colorDestructive};`);
+  if (colorDestructiveForeground) lightVars.push(`--destructive-foreground: ${colorDestructiveForeground};`);
+
+  if (colorBackgroundDark) {
+    darkVars.push(`--background: ${colorBackgroundDark};`);
+    darkVars.push(`--card: ${colorBackgroundDark};`);
+    darkVars.push(`--popover: ${colorBackgroundDark};`);
+    darkVars.push(`--input: ${colorBackgroundDark};`);
+  }
+  if (colorForegroundDark) {
+    darkVars.push(`--foreground: ${colorForegroundDark};`);
+    darkVars.push(`--card-foreground: ${colorForegroundDark};`);
+    darkVars.push(`--popover-foreground: ${colorForegroundDark};`);
+  }
+
+  const selector = `[data-user-theme-scope="${scopeKey}"]`;
+  let css = "";
+  if (lightVars.length > 0) {
+    css += `${selector} { ${lightVars.join(" ")} }`;
+  }
+  if (darkVars.length > 0) {
+    css += ` .dark ${selector}, ${selector}.dark { ${darkVars.join(" ")} }`;
+  }
+  return css;
+}
+
+export function userHasCustomization(user: UserThemeRow): boolean {
+  if (safeThemeId(user.theme) !== null) return true;
+  for (const key of USER_COLOR_COLUMNS) {
+    if (safeHsl(user[key]) !== null) return true;
+  }
+  return false;
+}
+
+/**
+ * Sanitize a user id into a CSS-attribute-safe scope key. UUIDs pass
+ * through unchanged; anything else has non-`[a-zA-Z0-9_-]` characters
+ * stripped. Always prefixed with `user-` so the value is never empty.
+ */
+export function buildScopeKey(userId: string): string | null {
+  if (typeof userId !== "string" || userId.length === 0) return null;
+  const cleaned = userId.replace(/[^a-zA-Z0-9_-]/g, "");
+  return cleaned.length > 0 ? `user-${cleaned}` : null;
+}
+
+/**
+ * Inject a per-user theme block in addition to the site theme, for first
+ * paint of `/users/:handle`. The site theme still owns `:root` (so navbar
+ * and footer keep matching the rest of the site); the user theme is
+ * scoped via the stable `[data-user-theme-scope="user-<id>"]` attribute
+ * selector that the client-side `UserThemeScope` wrapper carries. As
+ * soon as React mounts that wrapper inside the profile page the styles
+ * apply with no flicker — and because the wrapper is rendered *inside*
+ * the profile page (not around `#root`), navbar/footer stay site-themed.
+ *
+ * Returns null when no user is found (caller falls back to site theme).
+ */
+export async function injectUserTheme(
+  req: Request,
+  htmlPath: string,
+  handle: string,
+): Promise<string | null> {
+  try {
+    if (!handle) return null;
+    // Strip the `@` prefix from `/users/@handle`
+    const cleaned = handle.startsWith("@") ? handle.slice(1) : handle;
+    if (!cleaned) return null;
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      cleaned,
+    );
+
+    const userRows = isUuid
+      ? await db.select().from(usersTable).where(eq(usersTable.id, cleaned)).limit(1)
+      : await db.select().from(usersTable).where(eq(usersTable.username, cleaned)).limit(1);
+
+    const user = userRows[0] as UserThemeRow | undefined;
+    if (!user) return null;
+
+    const settings = await loadSettings();
+    const { themeId, css } = buildThemeInjection(settings);
+    const canonicalOrigin = getCanonicalOrigin(req);
+
+    let html = readHtml(htmlPath);
+    html = applyThemeToHtml(html, themeId, css, settings.heroSubheading);
+    
+    const globalScripts = buildGlobalScripts(canonicalOrigin, settings.defaultThemeMode);
+
+    if (userHasCustomization(user) && typeof user.id === "string") {
+      const scopeKey = buildScopeKey(user.id);
+      if (scopeKey) {
+        const userCss = buildUserThemeCss(user, scopeKey);
+        const safeTheme = safeThemeId(user.theme);
+
+        // Stable first-paint hook. Two pieces:
+        //
+        //   1. The `<style>` block in `<head>` whose selector is
+        //      `[data-user-theme-scope="<scopeKey>"]` — pre-loaded so it
+        //      applies the moment a matching wrapper is in the DOM.
+        //
+        //   2. A small `<script>` that publishes the scope key + theme on
+        //      `window.__USER_THEME_BOOTSTRAP__`. The React-rendered
+        //      `<UserThemeScope>` reads it synchronously on its first
+        //      render, so the wrapper exists with the right attributes
+        //      from frame 1 — even before the React Query fetch for the
+        //      user resolves. That means the head-injected styles match
+        //      and apply on first paint, with no flicker.
+        //
+        //   Both `scopeKey` and `safeTheme` are validated/whitelisted
+        //   above; we still use `JSON.stringify` to keep the script body
+        //   safe even if the validators ever loosen.
+        const bootstrap = JSON.stringify({
+          scopeKey,
+          theme: safeTheme,
+        }).replace(/</g, "\\u003c");
+
+        const styleBlock = userCss.length > 0
+          ? `  <style id="user-theme-server-style">${userCss}</style>\n`
+          : "";
+        const scriptBlock = `  <script id="user-theme-bootstrap">window.__USER_THEME_BOOTSTRAP__=${bootstrap};</script>\n`;
+
+        html = html.replace(
+          "</head>",
+          `${styleBlock}${scriptBlock}${globalScripts}\n  </head>`,
+        );
+
+      }
+    }
+
+    return html;
+  } catch (err) {
+    console.error("User theme injection failed:", err);
+    return null;
+  }
+}
+
+/**
+ * For `/categories/:slug` pages, expose the category-scoped Atom and
+ * JSON feeds via `<link rel="alternate">` so feed readers and IndieWeb
+ * tools can auto-discover them. Returns null when the slug doesn't
+ * resolve, letting the caller fall back to the site-wide alternate
+ * links injected by `injectThemeData`.
+ */
+export async function injectCategoryFeedLinks(
+  req: Request,
+  htmlPath: string,
+  rawSlug: string,
+): Promise<string | null> {
+  try {
+    const slug = String(rawSlug ?? "").toLowerCase();
+    if (!slug) return null;
+    const rows = await db
+      .select({ slug: categoriesTable.slug, name: categoriesTable.name })
+      .from(categoriesTable)
+      .where(eq(categoriesTable.slug, slug))
+      .limit(1);
+    const cat = rows[0];
+    if (!cat) return null;
+
+    const settings = await loadSettings();
+    const { themeId, css } = buildThemeInjection(settings);
+    const canonicalOrigin = getCanonicalOrigin(req);
+
+    let html = readHtml(htmlPath);
+    const categoryDescription = `Posts in the ${cat.name} category`;
+    html = applyThemeToHtml(html, themeId, css, categoryDescription);
+    
+    const globalScripts = buildGlobalScripts(canonicalOrigin, settings.defaultThemeMode);
+
+    const safeName = cat.name
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+    const base = `/categories/${cat.slug}`;
+    const categoryAlternates =
+      `  <link rel="alternate" type="application/atom+xml" data-scope="category" title="Atom feed — ${safeName}" href="${base}/feed.xml">\n` +
+      `  <link rel="alternate" type="application/feed+json" data-scope="category" title="JSON Feed — ${safeName}" href="${base}/feed.json">\n`;
+    html = html.replace("</head>", `${categoryAlternates}${globalScripts}\n  </head>`);
+    return html;
+  } catch (err) {
+    console.error("Category feed-link injection failed:", err);
+    return null;
+  }
+}
+
+/**
+ * For published `/p/:slug` CMS pages, expose the page-scoped Atom and
+ * JSON feeds via `<link rel="alternate">` so feed readers can pick up
+ * a subscription target for the single page. Returns null when the
+ * slug doesn't resolve to a published page.
+ */
+export async function injectPageFeedLinks(
+  req: Request,
+  htmlPath: string,
+  rawSlug: string,
+): Promise<string | null> {
+  try {
+    const slug = String(rawSlug ?? "").toLowerCase();
+    if (!slug) return null;
+    const rows = await db
+      .select({ slug: pagesTable.slug, title: pagesTable.title })
+      .from(pagesTable)
+      .where(and(eq(pagesTable.slug, slug), eq(pagesTable.status, "published")))
+      .limit(1);
+    const page = rows[0];
+    if (!page) return null;
+
+    const settings = await loadSettings();
+    const { themeId, css } = buildThemeInjection(settings);
+    const canonicalOrigin = getCanonicalOrigin(req);
+
+    let html = readHtml(htmlPath);
+    html = applyThemeToHtml(html, themeId, css, page.title);
+    
+    const globalScripts = buildGlobalScripts(canonicalOrigin, settings.defaultThemeMode);
+
+    const safeTitle = page.title
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+    const base = `/p/${page.slug}`;
+    const pageAlternates =
+      `  <link rel="alternate" type="application/atom+xml" data-scope="page" title="Atom feed — ${safeTitle}" href="${base}/feed.xml">\n` +
+      `  <link rel="alternate" type="application/feed+json" data-scope="page" title="JSON Feed — ${safeTitle}" href="${base}/feed.json">\n`;
+    html = html.replace("</head>", `${pageAlternates}\n${globalScripts}\n  </head>`);
+    return html;
+  } catch (err) {
+    console.error("Page feed-link injection failed:", err);
+    return null;
+  }
+}
+
+export async function injectPostMetadata(req: Request, htmlPath: string, postId: string): Promise<string | null> {
+  try {
+    const id = parseInt(postId, 10);
+    if (isNaN(id)) return null;
+
+    const post = await db.select().from(postsTable).where(eq(postsTable.id, id)).limit(1);
+    if (!post[0]) return null;
+
+    const settingsRows = await db.select().from(siteSettingsTable).where(eq(siteSettingsTable.id, 1)).limit(1);
+    const settings: PartialSettings = settingsRows[0] ?? {};
+    const siteTitle = settings.siteTitle ?? "Microblog";
+    const siteUrl = getCanonicalOrigin(req);
+    const authorName = post[0].authorName;
+    const description = post[0].contentFormat === "html"
+      ? post[0].content.replace(/<[^>]*>?/gm, "").substring(0, 200) + "..."
+      : post[0].content.substring(0, 200) + (post[0].content.length > 200 ? "..." : "");
+
+    const generatedOgImageUrl = `${siteUrl}/api/og/posts/${postId}`;
+    const ogImageUrl = post[0].featuredImageUrl || generatedOgImageUrl;
+    const postUrl = `${siteUrl}/posts/${postId}`;
+
+    const metaTags = `
+    <!-- Dynamic Social Metadata -->
+    <title>Post by ${authorName} | ${siteTitle}</title>
+    <meta name="description" content="${description}">
+    <meta property="og:title" content="Post by ${authorName} | ${siteTitle}">
+    <meta property="og:description" content="${description}">
+    <meta property="og:image" content="${ogImageUrl}">
+    <meta property="og:url" content="${postUrl}">
+    <meta property="og:type" content="article">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Post by ${authorName}">
+    <meta name="twitter:description" content="${description}">
+    <meta name="twitter:image" content="${ogImageUrl}">
+    `;
+
+    let html = readHtml(htmlPath);
+
+    const { themeId, css } = buildThemeInjection(settings);
+    html = applyThemeToHtml(html, themeId, css);
+    
+    const globalScripts = buildGlobalScripts(siteUrl, settings.defaultThemeMode);
+
+    html = html.replace("</head>", `${metaTags}\n${globalScripts}\n  </head>`);
+
+    return html;
+  } catch (err) {
+    console.error("Meta injection failed:", err);
+    return null;
+  }
+}
