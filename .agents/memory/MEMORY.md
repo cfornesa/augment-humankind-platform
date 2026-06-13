@@ -1,0 +1,1 @@
+- [Replit package proxy blocked packages](replit-proxy-blocked-packages.md) — es5-ext (protestware) and npm-run-path URL rewriting require lockfile patches to install cleanly.

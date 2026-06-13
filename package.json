@@ -31,6 +31,7 @@
   },
   "overrides": {
     "@esbuild-kit/esm-loader": "npm:tsx@^4.21.0",
-    "esbuild": "0.27.3"
+    "esbuild": "0.27.3",
+    "es5-ext": "0.10.56"
   }
 }
